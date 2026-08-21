@@ -39,6 +39,7 @@
   let reportState = { assignments: {}, form: {}, contextUpdatedAt: 0, updatedAt: 0 };
   let reportStateInitialized = false;
   let ribbonRefreshFrame = 0;
+  let lastStorageWarningAt = 0;
   const rootIdentityKeys = new WeakMap();
   let rootIdentityCounter = 0;
 
@@ -116,7 +117,9 @@
   }
 
   function clearContext(api) {
-    api.storage.set(STORAGE_KEY, emptyContext());
+    // Keep a tombstone timestamp so delayed Smart Doc recovery can distinguish
+    // an intentional clear from a transient empty storage read.
+    api.storage.set(STORAGE_KEY, { ...emptyContext(), updatedAt: Date.now() });
   }
 
   function ensureStyles() {
@@ -756,7 +759,7 @@
     function updatePreview() {
       const draft = draftContext();
       const teams = deriveTeams(draft);
-      const roundLabel = draft.roundNumber ? `Round ${draft.roundNumber}` : 'Round —';
+      const roundLabel = draft.roundNumber ? `Round ${normalizedRound(draft.roundNumber)}` : 'Round —';
       const matchup = draft.side
         ? `${draft.side}: ${draft.ourTeam || 'our team'} vs. ${draft.opponentTeam || 'opponent'}`
         : `${draft.ourTeam || 'our team'} vs. ${draft.opponentTeam || 'opponent'}`;
@@ -860,7 +863,7 @@
       const saved = saveContext(api, draft);
       closePluginModal();
       api.showToast(
-        `Round context saved: ${saved.tournamentName} Round ${saved.roundNumber} — ${saved.side} vs. ${saved.opponentTeam}.`
+        `Round context saved: ${saved.tournamentName} Round ${normalizedRound(saved.roundNumber)} — ${saved.side} vs. ${saved.opponentTeam}.`
       );
     });
 
@@ -879,11 +882,13 @@
     overlay.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         event.preventDefault();
+        event.stopPropagation();
         closePluginModal();
         return;
       }
       if (event.key === 'Enter' && event.target instanceof HTMLInputElement) {
         event.preventDefault();
+        event.stopPropagation();
         saveButton.click();
       }
     });
@@ -904,7 +909,7 @@
   }
 
   function smartDocName(context, speech) {
-    return `${context.tournamentName} Round ${context.roundNumber}---${speech} vs. ${context.opponentTeam}`;
+    return `${context.tournamentName} Round ${normalizedRound(context.roundNumber)}---${speech} vs. ${context.opponentTeam}`;
   }
 
   function dispatchHostSettingsStorageEvent(oldValue, newValue) {
@@ -923,12 +928,16 @@
 
   function temporarilyUseExactSpeechFilename(api) {
     let originalRaw = null;
+    let originalHadTemplate = false;
+    let originalTemplate;
     try {
       originalRaw = localStorage.getItem(HOST_SETTINGS_STORAGE_KEY);
       const parsed = originalRaw ? JSON.parse(originalRaw) : {};
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         throw new Error('CardMirror settings are not an object');
       }
+      originalHadTemplate = Object.prototype.hasOwnProperty.call(parsed, 'speechDocFilenameTemplate');
+      originalTemplate = parsed.speechDocFilenameTemplate;
       if (parsed.speechDocFilenameTemplate === SMART_DOC_FILENAME_TEMPLATE) {
         return () => {};
       }
@@ -937,7 +946,7 @@
       localStorage.setItem(HOST_SETTINGS_STORAGE_KEY, temporaryRaw);
       // CardMirror's settings store normally learns about localStorage writes
       // only in OTHER windows. Dispatch the same event locally so the window
-      // creating this Smart Doc sees {speech} before the prompt resolves.
+      // creating this Smart Doc sees {speech} before filename computation.
       dispatchHostSettingsStorageEvent(originalRaw, temporaryRaw);
     } catch (err) {
       console.warn('[Round Tools] could not temporarily set exact speech filename:', err);
@@ -951,13 +960,123 @@
       restored = true;
       try {
         const beforeRestore = localStorage.getItem(HOST_SETTINGS_STORAGE_KEY);
-        if (originalRaw === null) localStorage.removeItem(HOST_SETTINGS_STORAGE_KEY);
-        else localStorage.setItem(HOST_SETTINGS_STORAGE_KEY, originalRaw);
-        dispatchHostSettingsStorageEvent(beforeRestore, originalRaw);
+        let current = {};
+        try {
+          current = beforeRestore ? JSON.parse(beforeRestore) : {};
+        } catch (_) {
+          current = {};
+        }
+        if (!current || typeof current !== 'object' || Array.isArray(current)) current = {};
+        const next = { ...current };
+        if (originalHadTemplate) next.speechDocFilenameTemplate = originalTemplate;
+        else delete next.speechDocFilenameTemplate;
+        const nextRaw = originalRaw === null && Object.keys(next).length === 0
+          ? null
+          : JSON.stringify(next);
+        if (nextRaw === null) localStorage.removeItem(HOST_SETTINGS_STORAGE_KEY);
+        else localStorage.setItem(HOST_SETTINGS_STORAGE_KEY, nextRaw);
+        dispatchHostSettingsStorageEvent(beforeRestore, nextRaw);
       } catch (err) {
         console.warn('[Round Tools] could not restore CardMirror speech filename setting:', err);
       }
     };
+  }
+
+  function isMultiDocWorkspace() {
+    return Boolean(document.body && document.body.classList.contains('pmd-multi-doc'));
+  }
+
+  function armMultiPaneSpeechFilenameOverride(api, generatedName, expectedContext) {
+    let picker = null;
+    let pickerObserver = null;
+    let removalObserver = null;
+    let timeoutId = null;
+    let restoreFilenameTemplate = null;
+    let restoreTimer = null;
+    let cleaned = false;
+
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      pickerObserver?.disconnect();
+      removalObserver?.disconnect();
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      window.removeEventListener('keydown', onWindowKeyDown, true);
+      if (picker) picker.removeEventListener('click', onPickerClick, true);
+    };
+
+    const restoreSoon = () => {
+      if (restoreTimer !== null) return;
+      restoreTimer = window.setTimeout(() => {
+        restoreTimer = null;
+        restoreFilenameTemplate?.();
+        restoreRoundContextIfLost(api, expectedContext);
+        window.setTimeout(() => restoreRoundContextIfLost(api, expectedContext), 700);
+      }, 0);
+    };
+
+    const applyOverride = () => {
+      if (restoreFilenameTemplate) return true;
+      restoreFilenameTemplate = temporarilyUseExactSpeechFilename(api);
+      return Boolean(restoreFilenameTemplate);
+    };
+
+    function onPickerClick(event) {
+      const target = event.target instanceof Element ? event.target.closest('.pmd-route-btn') : null;
+      if (!target || !picker?.contains(target)) return;
+      if (applyOverride()) restoreSoon();
+    }
+
+    function onWindowKeyDown(event) {
+      if (!picker?.isConnected) return;
+      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+      if (event.key !== '1' && event.key !== '2' && event.key !== '3') return;
+      if (applyOverride()) restoreSoon();
+    }
+
+    const findPicker = () => {
+      const overlays = Array.from(document.querySelectorAll('.pmd-route-overlay'));
+      for (const overlay of overlays) {
+        if (!(overlay instanceof HTMLElement)) continue;
+        const header = overlay.querySelector('.pmd-route-header');
+        const text = stringValue(header?.textContent).trim().toLowerCase();
+        if (!text.includes('open speech')) continue;
+        if (generatedName && !text.includes(generatedName.toLowerCase())) continue;
+        return overlay;
+      }
+      return null;
+    };
+
+    const attach = () => {
+      if (picker) return true;
+      picker = findPicker();
+      if (!picker) return false;
+      picker.addEventListener('click', onPickerClick, true);
+      window.addEventListener('keydown', onWindowKeyDown, true);
+      removalObserver = new MutationObserver(() => {
+        if (picker && !picker.isConnected) {
+          // Cancel needs no override. A completed pick already scheduled a
+          // zero-delay restore, which runs after CardMirror's async continuation
+          // has synchronously computed the filename and Pocket heading.
+          if (restoreFilenameTemplate && restoreTimer === null) restoreSoon();
+          cleanup();
+        }
+      });
+      removalObserver.observe(document.body, { childList: true, subtree: true });
+      return true;
+    };
+
+    pickerObserver = new MutationObserver(() => {
+      if (attach()) pickerObserver?.disconnect();
+    });
+    pickerObserver.observe(document.body, { childList: true, subtree: true });
+    attach();
+    timeoutId = window.setTimeout(() => {
+      if (!picker) {
+        cleanup();
+        api.showToast('Smart Doc could not detect CardMirror\'s pane picker, so its exact filename format may not apply.');
+      }
+    }, 1800);
   }
 
   function nativeSpeechPromptParts() {
@@ -985,7 +1104,7 @@
     // create-window flow caused the plugin bag to be observed as empty, put
     // the exact pre-create context back. Never overwrite a different nonempty
     // context that the user may have intentionally saved in another window.
-    if (!hasContext(current)) {
+    if (!hasContext(current) && Number(current.updatedAt || 0) <= Number(expected.updatedAt || 0)) {
       try { api.storage.set(STORAGE_KEY, expected); } catch (err) {
         console.warn('[Round Tools] could not restore Round Context after Smart Doc creation:', err);
       }
@@ -1017,22 +1136,30 @@
       prompt.input.value = generatedName;
       prompt.input.dispatchEvent(new Event('input', { bubbles: true }));
       prompt.input.dispatchEvent(new Event('change', { bubbles: true }));
-      const restoreFilenameTemplate = temporarilyUseExactSpeechFilename(api);
-      if (!restoreFilenameTemplate) {
-        cleanup();
-        return true;
+      const multiDoc = isMultiDocWorkspace();
+      let restoreFilenameTemplate = null;
+      if (!multiDoc) {
+        restoreFilenameTemplate = temporarilyUseExactSpeechFilename(api);
+        if (!restoreFilenameTemplate) {
+          cleanup();
+          return true;
+        }
       }
       cleanup();
       requestAnimationFrame(() => {
+        // Single-doc CardMirror computes the filename immediately after this
+        // prompt resolves, before its first awaited serialization step.
+        // Multi-pane CardMirror prompts for a destination pane FIRST, so beta.11
+        // waits and applies {speech} only around the actual slot-selection event.
+        if (multiDoc) armMultiPaneSpeechFilenameOverride(api, generatedName, expectedContext);
         prompt.ok.click();
-        // CardMirror reads the filename template immediately after its prompt
-        // resolves. Give that continuation a turn, then put the user's global
-        // Files setting back exactly as it was.
-        window.setTimeout(() => {
-          restoreFilenameTemplate();
-          restoreRoundContextIfLost(api, expectedContext);
-        }, 250);
-        window.setTimeout(() => restoreRoundContextIfLost(api, expectedContext), 900);
+        if (!multiDoc) {
+          window.setTimeout(() => {
+            restoreFilenameTemplate?.();
+            restoreRoundContextIfLost(api, expectedContext);
+          }, 0);
+          window.setTimeout(() => restoreRoundContextIfLost(api, expectedContext), 700);
+        }
       });
       return true;
     }
@@ -1102,7 +1229,7 @@
     const teams = deriveTeams(context);
     const summary = document.createElement('div');
     summary.className = 'cm-rt-smart-summary';
-    summary.textContent = `${context.tournamentName} · Round ${context.roundNumber} · AFF ${teams.affTeam} · NEG ${teams.negTeam}`;
+    summary.textContent = `${context.tournamentName} · Round ${normalizedRound(context.roundNumber)} · AFF ${teams.affTeam} · NEG ${teams.negTeam}`;
     if (context.judgeName) summary.textContent += ` · Judge(s) ${context.judgeName}`;
 
     const speechWrapper = document.createElement('label');
@@ -1172,11 +1299,13 @@
     overlay.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         event.preventDefault();
+        event.stopPropagation();
         closePluginModal();
         return;
       }
       if (event.key === 'Enter' && event.target === speechSelect) {
         event.preventDefault();
+        event.stopPropagation();
         createButton.click();
       }
     });
@@ -1235,11 +1364,22 @@
   }
 
   function persistReportState(api, nextState, shouldBroadcast = true) {
+    const previousUpdatedAt = Number(reportState.updatedAt) || 0;
     reportState = normalizeReportState(nextState);
-    reportState.updatedAt = Number(nextState.updatedAt) || Date.now();
+    reportState.updatedAt = Math.max(Number(nextState.updatedAt) || 0, Date.now(), previousUpdatedAt + 1);
     reportStateInitialized = true;
-    try { api.storage.set(REPORT_STATE_KEY, reportState); } catch (err) {
+    let persisted = true;
+    try {
+      api.storage.set(REPORT_STATE_KEY, reportState);
+      const check = normalizeReportState(api.storage.get(REPORT_STATE_KEY));
+      persisted = Number(check.updatedAt) === Number(reportState.updatedAt);
+    } catch (err) {
+      persisted = false;
       console.warn('[Round Tools] could not save round report state:', err);
+    }
+    if (!persisted && Date.now() - lastStorageWarningAt > 10000) {
+      lastStorageWarningAt = Date.now();
+      api.showToast('Round Tools could not persist the speech assignments. Plugin storage may be full; export this round report before closing CardMirror.');
     }
     if (shouldBroadcast && reportChannel) {
       try { reportChannel.postMessage({ type: 'state', sender: REPORT_INSTANCE_ID, state: reportState }); } catch (_) {}
@@ -1574,8 +1714,10 @@
     if(node.type==='hard_break' || node.type==='hardbreak') return '<w:r><w:br/></w:r>';
     if(node.type==='image'){
       // Preserve a readable placeholder rather than silently dropping an image.
-      const alt=(node.attrs && node.attrs.alt) || '[image]';
-      return textRunXml('['+alt+']', []);
+      const rawAlt=stringValue(node.attrs && node.attrs.alt).trim();
+      const alt=rawAlt || 'image';
+      const label=(alt.startsWith('[') && alt.endsWith(']')) ? alt : '['+alt+']';
+      return textRunXml(label, []);
     }
     return (node.content || []).map(inlineXml).join('');
   }
@@ -1887,6 +2029,7 @@
     overlay.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         event.preventDefault();
+        event.stopPropagation();
         closePluginModal();
       }
     });
