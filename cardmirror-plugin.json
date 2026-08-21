@@ -1,7 +1,7 @@
 {
   "id": "cardmirror-round-tools",
   "name": "Round Tools",
-  "version": "0.1.0-beta.5",
+  "version": "0.1.0-beta.10",
   "description": "Round context, Smart Docs, speech assignments, and round reports for debate rounds.",
   "author": "Evan Xiang",
   "apiVersion": 1,
